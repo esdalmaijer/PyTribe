@@ -10,8 +10,8 @@ example
     import pytribe
     
     # initialize connectiom
-    c = connection()
-    t = tracker(c)
+    c = pytribe.connection()
+    t = pytribe.tracker(c)
     
     # ask for something
     t.get_version()
