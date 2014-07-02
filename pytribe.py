@@ -3,12 +3,292 @@
 # author: Edwin Dalmaijer
 # email: edwin.dalmaijer@psy.ox.ac.uk
 # 
-# version 1 (01-Jul-2014)
+# version 2 (02-Jul-2014)
 
 
+import copy
 import json
+import time
 import socket
+from threading import Thread
+from multiprocessing import Queue
 
+
+class EyeTribe:
+	
+	"""class for eye tracking and data collection using an EyeTribe tracker
+	"""
+	
+	def __init__(self, logfilename='default.txt'):
+		
+		"""Initializes an EyeTribe instance
+		
+		keyword arguments
+		
+		logfilename	--	string indicating the log file name, including
+						a full path to it's location and an extension
+						(default = 'default.txt')
+		"""
+		
+		# initialize data collectors
+		self._logfile = open(logfilename, 'w')
+		self._separator = '\t'
+		self._log_header()
+		self._queue = Queue()
+		
+		# initialize connection
+		self._connection = connection(host='localhost',port=6555)
+		self._tracker = tracker(self._connection)
+		self._heartbeat = heartbeat(self._connection)
+		
+		# initialize heartbeat thread
+		self._beating = True
+		self._heartbeatinterval = self._tracker.get_heartbeatinterval() / 1000.0
+		self._hbthread = Thread(target=self._heartbeater, args=[self._heartbeatinterval])
+		self._hbthread.daemon = True
+		self._hbthread.name = 'heartbeater'
+
+		# initialize sample streamer
+		self._streaming = True
+		self._samplefreq = self._tracker.get_framerate()
+		self._intsampletime = 1.0 / self._samplefreq
+		self._ssthread = Thread(target=self._stream_samples, args=[self._queue])
+		self._ssthread.daemon = True
+		self._ssthread.name = 'samplestreamer'
+		
+		# initialize data processer
+		self._processing = True
+		self._logdata = False
+		self._currentsample = self._tracker.get_frame()
+		self._dpthread = Thread(target=self._process_samples, args=[self._queue])
+		self._dpthread.name = 'dataprocessor'
+		
+		# start all threads
+		self._hbthread.start()
+		self._ssthread.start()
+		self._dpthread.start()
+	
+	def start_recording(self):
+		
+		"""Starts data recording
+		"""
+		
+		# set self._logdata to True, so the data processing thread starts
+		# writing samples to the log file
+		if not self._logdata:
+			self._logdata = True
+			self.log_message("start_recording")
+	
+	def stop_recording(self):
+		
+		"""Stops data recording
+		"""
+		
+		# set self._logdata to False, so the data processing thread does not
+		# write samples to the log file
+		if self._logdata:
+			self.log_message("stop_recording")
+			self._logdata = False
+	
+	def log_message(self, message):
+		
+		"""Logs a message to the logfile, time locked to the most recent
+		sample
+		"""
+		
+		# timestamp, based on the most recent sample
+		if self._currentsample != None:
+			ts = self._currentsample['timestamp']
+			t = self._currentsample['time']
+		else:
+			ts = ''
+			t = ''
+		# assemble line
+		line = self._separator.join(map(str,['MSG',ts,t,message]))
+		# write message
+		self._logfile.write(line + '\n')
+	
+	def sample(self):
+		
+		"""Returns the most recent point of regard (=gaze location on screen)
+		coordinates (smoothed signal)
+		
+		arguments
+		
+		None
+		
+		returns
+		
+		gaze		--	a (x,y) tuple indicating the point of regard
+		"""
+		
+		if self._currentsample == None:
+			return None, None
+		else:
+			return (self._currentsample['avgx'],self._currentsample['avgy'])
+	
+	def pupil_size(self):
+		
+		"""Returns the most recent pupil size sample (an average of the size
+		of both pupils)
+		
+		arguments
+		
+		None
+		
+		returns
+		
+		pupsize	--	a float indicating the pupil size (in arbitrary units)
+		"""
+		
+		if self._currentsample == None:
+			return None
+		else:
+			return self._currentsample['psize']
+	
+	def close(self):
+		
+		"""Stops all data streaming, and closes both the connection to the
+		tracker and the logfile
+		"""
+		
+		# if we are currently recording, stop doing so
+		if self._logdata:
+			self.stop_recording()
+		
+		# signal all threads to halt
+		self._beating = False
+		self._streaming = False
+		self._processing = False
+		
+		# close the log file
+		self._logfile.close()
+		
+		# close the connection
+		self._connection.close()
+	
+	def _heartbeater(self, heartbeatinterval):
+		
+		"""Continuously sends heartbeats to the tracker, to let it know the
+		connection is still alive (it seems to think we could die any
+		moment now, and is very keen on reassurance of our good health;
+		almost like my grandparents...)
+		
+		arguments
+		
+		heartbeatinterval	--	float indicating the heartbeatinterval in
+							seconds; note that this is different from
+							the value that the EyeTribe tracker reports:
+							that value is in milliseconds and should be
+							recalculated to seconds here!
+		"""
+
+		# keep beating until it is signalled that we should stop		
+		while self._beating:
+			# send heartbeat
+			self._heartbeat.beat()
+			# wait for a bit
+			time.sleep(heartbeatinterval)
+	
+	def _stream_samples(self, queue):
+		
+		"""Continuously polls the device, and puts all new samples in a
+		Queue instance
+		
+		arguments
+		
+		queue		--	a multithreading.Queue instance, to put samples
+						into
+		"""
+		
+		# keep streaming until it is signalled that we should stop
+		while self._streaming:
+			# get a new sample
+			sample = self._tracker.get_frame()
+			# put the sample in the Queue
+			queue.put(sample)
+			# pause during the intersample time, to avoid an overflow
+			time.sleep(self._intsampletime)
+	
+	def _process_samples(self, queue):
+		
+		"""Continuously processes samples, updating the most recent sample
+		and writing data to a the log file when self._logdata is set to True
+		
+		arguments
+		
+		queue		--	a multithreading.Queue instance, to read samples
+						from
+		"""
+		
+		# keep processing until it is signalled that we should stop
+		while self._processing:
+			# read new item from the queue
+			sample = queue.get()
+			# update newest sample
+			self._currentsample = copy.deepcopy(sample)
+			# write to file if data logging is on
+			if self._logdata:
+				self._log_sample(sample)
+		
+		print("processing thread terminated")
+		return
+	
+	def _log_sample(self, sample):
+		
+		"""Writes a sample to the log file
+		
+		arguments
+		
+		sample		--	a sample dict, as is returned by
+						tracker.get_frame
+		"""
+		
+		# assemble new line
+		line = self._separator.join(map(str,[	sample['timestamp'],
+										sample['time'],
+										sample['fix'],
+										sample['state'],
+										sample['rawx'],
+										sample['rawy'],
+										sample['avgx'],
+										sample['avgy'],
+										sample['psize'],
+										sample['Lrawx'],
+										sample['Lrawy'],
+										sample['Lavgx'],
+										sample['Lavgy'],
+										sample['Lpsize'],
+										sample['Lpupilx'],
+										sample['Lpupily'],
+										sample['Rrawx'],
+										sample['Rrawy'],
+										sample['Ravgx'],
+										sample['Ravgy'],
+										sample['Rpsize'],
+										sample['Rpupilx'],
+										sample['Rpupily']
+								]))
+		# write line to log file
+		self._logfile.write(line + '\n')
+	
+	def _log_header(self):
+		
+		"""Logs a header to the data file
+		"""
+		
+		# write a header to the data file
+		header = self._separator.join(['timestamp','time','fix','state',
+								'rawx','rawy','avgx','avgy','psize',
+								'Lrawx','Lrawy','Lavgx','Lavgy','Lpsize','Lpupilx','Lpupily',
+								'Rrawx','Rrawy','Ravgx','Ravgy','Rpsize','Rpupilx','Rpupily'
+								])
+		self._logfile.write(header + '\n')
+		self._firstlog = False
+
+
+# # # # #
+# low-level classes
 
 class connection:
 	
@@ -33,6 +313,8 @@ class connection:
 		# initialize a connection
 		self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 		self.sock.connect((self.host,self.port))
+		
+		# start heartbeat thread
 	
 	def request(self, category, request, values):
 		
@@ -49,13 +331,16 @@ class connection:
 		msg = self.create_json(category, request, values)
 		# send the message over the connection
 		response = self.sock.send(msg)
+		
 		# get response
 		if type(response) != str:
 			try:
 				response = self.sock.recv(32768)
-			except:
+			except socket.error:
+				print("reviving connection")
 				self.revive()
-				response = self.sock.recv(32768)
+				response = '{"statuscode":901,"values":{"statusmessage":"connection error"}}'
+
 		# return the parsed response
 		return self.parse_json(response)
 	
@@ -116,12 +401,17 @@ class connection:
 			raise Exception("values should be dict, tuple or list, not '%s' (values = %s)" % (type(values),values))
 		
 		# create the json message
-		if values == None:
+		if request == None:
+			jsonmsg = '''
+{
+"category": "%s"
+}''' % (category)
+		elif values == None:
 			jsonmsg = '''
 {
 "category": "%s",
 "request": "%s",
-''' % (category, request)
+}''' % (category, request)
 		else:
 			jsonmsg = '''
 {
@@ -345,15 +635,15 @@ class tracker:
 				'Ravgx': integer smoothed y right eye gaze coordinate in pixels,
 				'Rpsize': float right eye pupil size,
 				'Rpupilx': integer raw right eye pupil centre x coordinate,
-				'Rpupily': integer raw right eye pupil centre y coordinate,
+				'Rpupily': integer raw right eye pupil centre y coordinate
 				}
 		"""
 		
 		# send the request
-		response = self.connection.request('tracker', 'get', ['iscalibrated'])
+		response = self.connection.request('tracker', 'get', ['frame'])
 		# raise error if needed
 		if response['statuscode'] != 200:
-			raise Exception("Error in tracker.get_iscalibrated: %s (code %d)" % (response['values']['statusmessage'],response['statuscode']))
+			raise Exception("Error in tracker.get_frame: %s (code %d)" % (response['values']['statusmessage'],response['statuscode']))
 		# parse response
 		return {	'timestamp':	response['values']['frame']['timestamp'],
 				'time':		response['values']['frame']['time'],
@@ -820,3 +1110,27 @@ class heartbeat:
 		"""
 		
 		self.connection = connection
+	
+	def beat(self):
+		
+		"""Sends a heartbeat to the device
+		"""
+		
+		# send the request
+		response = self.connection.request('heartbeat', None, None)
+		# return value or error
+		if response['statuscode'] == 200:
+			return True
+		else:
+			raise Exception("Error in heartbeat.beat: %s (code %d)" % (response['values']['statusmessage'],response['statuscode']))
+		
+
+# # # # #
+# DEBUG #
+if __name__ == "__main__":
+	test = EyeTribe()
+	test.start_recording()
+	time.sleep(10)
+	test.stop_recording()
+	test.close()
+# # # # #
