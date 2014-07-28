@@ -955,6 +955,11 @@ class calibration:
 		"""Mark the end of processing a calibration point
 		
 		returns
+
+		NORMALLY:
+		success		--	Boolean: True on success, False on failure
+
+		AFTER FINAL POINT:
 		calibresults	--	a dict containing the calibration results:
 						{	'result':	Boolean indicating whether the
 									calibration was succesful
@@ -1022,30 +1027,37 @@ class calibration:
 		# return value or error
 		if response['statuscode'] != 200:
 			raise Exception("Error in calibration.pointend: %s (code %d)" % (response['values']['statusmessage'],response['statuscode']))
-		# return calibration dict
-		returndict =  {	'result':response['value']['calibresult']['result'],
-						'deg':response['value']['calibresult']['deg'],
-						'Rdeg':response['value']['calibresult']['degl'],
-						'Ldeg':response['value']['calibresult']['degr'],
-						'calibpoints':[]
-						}
-		for pointdict in response['value']['calibresult']['calibpoints']:
-			returndict['calibpoints'].append({	'state':pointdict['state'],
-										'cpx':pointdict['cp']['x'],
-										'cpy':pointdict['cp']['y'],
-										'mecpx':pointdict['mecp']['x'],
-										'mecpy':pointdict['mecp']['y'],
-										'acd':pointdict['acd']['ad'],
-										'Lacd':pointdict['acd']['adl'],
-										'Racd':pointdict['acd']['adr'],
-										'mepix':pointdict['mepix']['mep'],
-										'Lmepix':pointdict['mepix']['mepl'],
-										'Rmepix':pointdict['mepix']['mepr'],
-										'asdp':pointdict['asdp']['asd'],
-										'Lasdp':pointdict['asdp']['asdl'],
-										'Rasdp':pointdict['asdp']['asdr']
-										})
-		return returndict
+		
+		# return True if this was not the final calibration point
+		if not 'calibpoints' in response['values']:
+			return True
+		
+		# if this was the final calibration point, return the results
+		else:
+			# return calibration dict
+			returndict =  {	'result':response['values']['calibresult']['result'],
+							'deg':response['values']['calibresult']['deg'],
+							'Rdeg':response['values']['calibresult']['degl'],
+							'Ldeg':response['values']['calibresult']['degr'],
+							'calibpoints':[]
+							}
+			for pointdict in response['values']['calibresult']['calibpoints']:
+				returndict['calibpoints'].append({	'state':pointdict['state'],
+											'cpx':pointdict['cp']['x'],
+											'cpy':pointdict['cp']['y'],
+											'mecpx':pointdict['mecp']['x'],
+											'mecpy':pointdict['mecp']['y'],
+											'acd':pointdict['acd']['ad'],
+											'Lacd':pointdict['acd']['adl'],
+											'Racd':pointdict['acd']['adr'],
+											'mepix':pointdict['mepix']['mep'],
+											'Lmepix':pointdict['mepix']['mepl'],
+											'Rmepix':pointdict['mepix']['mepr'],
+											'asdp':pointdict['asdp']['asd'],
+											'Lasdp':pointdict['asdp']['asdl'],
+											'Rasdp':pointdict['asdp']['asdr']
+											})
+			return returndict
 	
 	def abort(self):
 		
