@@ -67,6 +67,9 @@ class EyeTribe:
 		self._hbthread.start()
 		self._ssthread.start()
 		self._dpthread.start()
+		
+		# initialize calibration
+		self.calibration = calibration(self._connection)
 	
 	def start_recording(self):
 		
@@ -313,8 +316,6 @@ class connection:
 		# initialize a connection
 		self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 		self.sock.connect((self.host,self.port))
-		
-		# start heartbeat thread
 	
 	def request(self, category, request, values):
 		
