@@ -1,7 +1,7 @@
 PyTribe
 =======
 
-Python wrapper for the EyeTribe SDK by Edwin Dalmaijer. Version 2, 02-07-2014.
+Python wrapper for the EyeTribe SDK by Edwin Dalmaijer. Version 3, 11-08-2014.
 
 
 example
