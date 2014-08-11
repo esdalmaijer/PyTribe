@@ -3,14 +3,14 @@
 # author: Edwin Dalmaijer
 # email: edwin.dalmaijer@psy.ox.ac.uk
 # 
-# version 2 (02-Jul-2014)
+# version 3 (11-Aug-2014)
 
-
+import os
 import copy
 import json
 import time
 import socket
-from threading import Thread
+from threading import Thread, Lock
 from multiprocessing import Queue
 
 
@@ -31,7 +31,7 @@ class EyeTribe:
 		"""
 		
 		# initialize data collectors
-		self._logfile = open(logfilename, 'w')
+		self._logfile = open('%s.tsv' % (logfilename), 'w')
 		self._separator = '\t'
 		self._log_header()
 		self._queue = Queue()
@@ -40,6 +40,9 @@ class EyeTribe:
 		self._connection = connection(host='localhost',port=6555)
 		self._tracker = tracker(self._connection)
 		self._heartbeat = heartbeat(self._connection)
+		
+		# create a new Lock
+		self._lock = Lock()
 		
 		# initialize heartbeat thread
 		self._beating = True
@@ -61,6 +64,7 @@ class EyeTribe:
 		self._logdata = False
 		self._currentsample = self._tracker.get_frame()
 		self._dpthread = Thread(target=self._process_samples, args=[self._queue])
+		self._dpthread.daemon = True
 		self._dpthread.name = 'dataprocessor'
 		
 		# start all threads
@@ -109,7 +113,9 @@ class EyeTribe:
 		# assemble line
 		line = self._separator.join(map(str,['MSG',ts,t,message]))
 		# write message
-		self._logfile.write(line + '\n')
+		self._logfile.write(line + '\n') # to internal buffer
+		self._logfile.flush() # internal buffer to RAM
+		os.fsync(self._logfile.fileno()) # RAM file cache to disk
 	
 	def sample(self):
 		
@@ -170,6 +176,16 @@ class EyeTribe:
 		# close the connection
 		self._connection.close()
 	
+	def _wait_while_calibrating(self):
+		
+		"""Waits until the tracker is not in the calibration state
+		"""
+		
+		while self._tracker.get_iscalibrating():
+			pass
+		
+		return True
+	
 	def _heartbeater(self, heartbeatinterval):
 		
 		"""Continuously sends heartbeats to the tracker, to let it know the
@@ -188,8 +204,14 @@ class EyeTribe:
 
 		# keep beating until it is signalled that we should stop		
 		while self._beating:
+			# do not bother the tracker when it is calibrating
+			#self._wait_while_calibrating()
+			# wait for the Threading Lock to be released, then lock it
+			self._lock.acquire(True)
 			# send heartbeat
 			self._heartbeat.beat()
+			# release the Threading Lock
+			self._lock.release()
 			# wait for a bit
 			time.sleep(heartbeatinterval)
 	
@@ -206,10 +228,16 @@ class EyeTribe:
 		
 		# keep streaming until it is signalled that we should stop
 		while self._streaming:
+			# do not bother the tracker when it is calibrating
+			#self._wait_while_calibrating()
+			# wait for the Threading Lock to be released, then lock it
+			self._lock.acquire(True)
 			# get a new sample
 			sample = self._tracker.get_frame()
 			# put the sample in the Queue
 			queue.put(sample)
+			# release the Threading Lock
+			self._lock.release()
 			# pause during the intersample time, to avoid an overflow
 			time.sleep(self._intsampletime)
 	
@@ -226,16 +254,21 @@ class EyeTribe:
 		
 		# keep processing until it is signalled that we should stop
 		while self._processing:
+			# wait for the Threading Lock to be released, then lock it
+			self._lock.acquire(True)
 			# read new item from the queue
-			sample = queue.get()
+			if not queue.empty():
+				sample = queue.get()
+			else:
+				sample = None
+			# release the Threading Lock
+			self._lock.release()
 			# update newest sample
-			self._currentsample = copy.deepcopy(sample)
-			# write to file if data logging is on
-			if self._logdata:
-				self._log_sample(sample)
-		
-		print("processing thread terminated")
-		return
+			if sample != None:
+				self._currentsample = copy.deepcopy(sample)
+				# write to file if data logging is on
+				if self._logdata:
+					self._log_sample(sample)
 	
 	def _log_sample(self, sample):
 		
@@ -273,7 +306,9 @@ class EyeTribe:
 										sample['Rpupily']
 								]))
 		# write line to log file
-		self._logfile.write(line + '\n')
+		self._logfile.write(line + '\n') # to internal buffer
+		self._logfile.flush() # internal buffer to RAM
+		os.fsync(self._logfile.fileno()) # RAM file cache to disk
 	
 	def _log_header(self):
 		
@@ -286,7 +321,9 @@ class EyeTribe:
 								'Lrawx','Lrawy','Lavgx','Lavgy','Lpsize','Lpupilx','Lpupily',
 								'Rrawx','Rrawy','Ravgx','Ravgy','Rpsize','Rpupilx','Rpupily'
 								])
-		self._logfile.write(header + '\n')
+		self._logfile.write(header + '\n') # to internal buffer
+		self._logfile.flush() # internal buffer to RAM
+		os.fsync(self._logfile.fileno()) # RAM file cache to disk
 		self._firstlog = False
 
 
@@ -312,6 +349,8 @@ class connection:
 		# properties
 		self.host = host
 		self.port = port
+		self.resplist = []
+		self.DEBUG = False
 		
 		# initialize a connection
 		self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -331,19 +370,60 @@ class connection:
 		# create a JSON formatted string
 		msg = self.create_json(category, request, values)
 		# send the message over the connection
-		response = self.sock.send(msg)
+		self.sock.send(msg)
+		# print request in DEBUG mode
+		if self.DEBUG:
+			print("REQUEST: '%s'" % msg)
 		
-		# get response
-		if type(response) != str:
-			try:
-				response = self.sock.recv(32768)
-			except socket.error:
-				print("reviving connection")
-				self.revive()
-				response = '{"statuscode":901,"values":{"statusmessage":"connection error"}}'
-
-		# return the parsed response
-		return self.parse_json(response)
+		# give the tracker a wee bit of time to reply
+		time.sleep(0.005)
+		
+		# get new responses
+		success = self.get_response()
+		
+		# return the appropriate response
+		if success:
+			for i in range(len(self.resplist)):
+				# check if the category matches
+				if self.resplist[i]['category'] == category:
+					# if this is a heartbeat, return
+					if self.resplist[i]['category'] == 'heartbeat':
+						return self.resplist.pop(i)
+					# if this is another category, check if the request
+					# matches
+					elif self.resplist[i]['request'] == request:
+						return self.resplist.pop(i)
+		# on a connection error, get_response returns False and a connection
+		# error should be returned
+		else:
+			return self.parse_json('{"statuscode":901,"values":{"statusmessage":"connection error"}}')
+	
+	def get_response(self):
+		
+		"""Asks for a response, and adds these to the list of all received
+		responses (basically a very simple queue)
+		"""
+		
+		# try to get a new response
+		try:
+			response = self.sock.recv(32768)
+			# print reply in DEBUG mode
+			if self.DEBUG:
+				print("REPLY: '%s'" % response)
+		# if it fails, revive the connection and return a connection error
+		except socket.error:
+			print("reviving connection")
+			self.revive()
+			response = '{"statuscode":901,"values":{"statusmessage":"connection error"}}'
+			return False
+		# split the responses (in case multiple came in)
+		response = response.split('\n')
+		# add parsed responses to the internal list
+		for r in response:
+			if r:
+				self.resplist.append(self.parse_json(r))
+		
+		return True
 	
 	def create_json(self, category, request, values):
 		
@@ -610,6 +690,117 @@ class tracker:
 			return response['values']['iscalibrating'] == 'true'
 		else:
 			raise Exception("Error in tracker.get_iscalibrating: %s (code %d)" % (response['values']['statusmessage'],response['statuscode']))
+	
+	def get_calibresult(self):
+		
+		"""Gets the latest valid calibration result
+		
+		returns
+
+		WITHOUT CALIBRATION:
+		None
+
+		WITH CALIBRATION:
+		calibresults	--	a dict containing the calibration results:
+						{	'result':	Boolean indicating whether the
+									calibration was succesful
+							'deg':	float indicating the average error
+									in degrees of visual angle
+							'Ldeg':	float indicating the left eye
+									error in degrees of visual angle
+							'Rdeg':	float indicating the right eye
+									error in degrees of visual angle
+							'calibpoints': list, containing a dict for
+										each calibration point:
+										{'state':	integer indicating
+												the state of the
+												calibration point
+												(0 means no useful
+												data has been
+												obtained and the
+												point should be
+												resampled; 1 means
+												the data is of
+												questionable
+												quality, consider
+												resampling; 2 means
+												the data is ok)
+										'cpx':	x coordinate of the
+												calibration point
+										'cpy':	y coordinate of the
+												calibration point
+										'mecpx':	mean estimated x
+												coordinate of the
+												calibration point
+										'mecpy':	mean estimated y
+												coordinate of the
+												calibration point
+										'acd':	float indicating
+												the accuracy in
+												degrees of visual
+												angle
+										'Lacd':	float indicating
+												the accuracy in
+												degrees of visual
+												angle (left eye)
+										'Racd':	float indicating
+												the accuracy in
+												degrees of visual
+												angle (right eye)
+										'mepix':	mean error in
+												pixels
+										'Lmepix':	mean error in
+												pixels (left eye)
+										'Rmepix':	mean error in
+												pixels (right eye)
+										'asdp':	standard deviation
+												in pixels
+										'Lasdp':	standard deviation
+												in pixels (left eye)
+										'Rasdp':	standard deviation
+												in pixels (right eye)
+										}
+						}
+		
+		"""
+		
+		# send the request
+		response = self.connection.request('tracker', 'get', ['calibresult'])
+
+		# return value or error
+		if response['statuscode'] != 200:
+			raise Exception("Error in tracker.get_calibresult: %s (code %d)" % (response['values']['statusmessage'],response['statuscode']))
+		
+		# return True if this was not the final calibration point
+		if not 'calibpoints' in response['values']:
+			return None
+		
+		# if this was the final calibration point, return the results
+		else:
+			# return calibration dict
+			returndict =  {	'result':response['values']['calibresult']['result'],
+							'deg':response['values']['calibresult']['deg'],
+							'Rdeg':response['values']['calibresult']['degl'],
+							'Ldeg':response['values']['calibresult']['degr'],
+							'calibpoints':[]
+							}
+			for pointdict in response['values']['calibresult']['calibpoints']:
+				returndict['calibpoints'].append({	'state':pointdict['state'],
+											'cpx':pointdict['cp']['x'],
+											'cpy':pointdict['cp']['y'],
+											'mecpx':pointdict['mecp']['x'],
+											'mecpy':pointdict['mecp']['y'],
+											'acd':pointdict['acd']['ad'],
+											'Lacd':pointdict['acd']['adl'],
+											'Racd':pointdict['acd']['adr'],
+											'mepix':pointdict['mepix']['mep'],
+											'Lmepix':pointdict['mepix']['mepl'],
+											'Rmepix':pointdict['mepix']['mepr'],
+											'asdp':pointdict['asdp']['asd'],
+											'Lasdp':pointdict['asdp']['asdl'],
+											'Rasdp':pointdict['asdp']['asdr']
+											})
+			return returndict
 	
 	def get_frame(self):
 		
@@ -1030,7 +1221,7 @@ class calibration:
 			raise Exception("Error in calibration.pointend: %s (code %d)" % (response['values']['statusmessage'],response['statuscode']))
 		
 		# return True if this was not the final calibration point
-		if not 'calibpoints' in response['values']:
+		if not 'calibresult' in response['values']:
 			return True
 		
 		# if this was the final calibration point, return the results
