@@ -13,7 +13,7 @@ import socket
 import codecs
 from threading import Lock, Thread
 from multiprocessing import Event, Process, Queue
-from pygaze.py3compat import *
+from py3compat import *
 
 
 # # # # #
